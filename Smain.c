@@ -9,7 +9,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
-#define PORT 8080
+#define PORT 8093
 #define BUFFER_SIZE 1024
 
 void handle_client(int client_socket, char *buffer);
@@ -18,6 +18,11 @@ void handle_ufile(int client_socket, char *filename, char *destination_path);
 void create_dir(const char *path);
 void send_file_to_server(const char *server_ip, int server_port, const char *filename, const char *destination_path);
 void expand_path(char *expanded_path, const char *path);
+void handle_rmfile(int client_socket, char *filename);
+void send_tar_request_to_server(int client_socket, const char *tar_name, const char *server_ip, int server_port);
+void handle_dtar(int client_socket, const char *filetype);
+void send_file_to_client(int client_socket, const char *filename);
+void create_tar(const char *directory, const char *tar_name);
 
 int main() {
     int server_socket, client_socket;
@@ -104,11 +109,16 @@ void handle_client(int client_socket, char *buffer) {
 
     if (strcmp(command, "ufile") == 0) {
         handle_ufile(client_socket, filename, destination_path);
+    } else if (strcmp(command, "rmfile") == 0) {
+        handle_rmfile(client_socket, filename);
+    } else if (strcmp(command, "dtar") == 0) {
+        handle_dtar(client_socket, filename);
     } else {
         printf("Unknown command: %s\n", command);
         send(client_socket, "Invalid command\n", 16, 0);
     }
 }
+
 
 void create_dir(const char *path) {
     char tmp[BUFFER_SIZE];
@@ -153,12 +163,22 @@ void handle_ufile(int client_socket, char *filename, char *destination_path) {
         // Transfer to Spdf server
         snprintf(server_message, BUFFER_SIZE, "ufile %s %s", filename, expanded_path);
         strcpy(server_ip, "127.0.0.1");
-        server_port = 8081;
+        server_port = 8067;
+        send(client_socket, "ready", strlen("ready"), 0); // Notify client to send file
+        send_file_to_server(server_ip, server_port, filename, expanded_path);
+        // Notify client of successful upload
+        snprintf(buffer, BUFFER_SIZE, "File %s uploaded successfully to Spdf server\n", filename);
+        send(client_socket, buffer, strlen(buffer), 0);
     } else if (strstr(filename, ".txt") != NULL) {
         // Transfer to Stext server
         snprintf(server_message, BUFFER_SIZE, "ufile %s %s", filename, expanded_path);
         strcpy(server_ip, "127.0.0.1");
-        server_port = 8082;
+        server_port = 8068;
+        send(client_socket, "ready", strlen("ready"), 0); // Notify client to send file
+        send_file_to_server(server_ip, server_port, filename, expanded_path);
+        // Notify client of successful upload
+        snprintf(buffer, BUFFER_SIZE, "File %s uploaded successfully to Stext server\n", filename);
+        send(client_socket, buffer, strlen(buffer), 0);
     } else if (strstr(filename, ".c") != NULL) {
         // Store locally on Smain server
         create_dir(expanded_path);
@@ -166,25 +186,29 @@ void handle_ufile(int client_socket, char *filename, char *destination_path) {
         file = open(buffer, O_WRONLY | O_CREAT, 0666);
         if (file < 0) {
             perror("File creation failed");
+            snprintf(buffer, BUFFER_SIZE, "Error creating file %s\n", filename);
+            send(client_socket, buffer, strlen(buffer), 0);
             return;
         }
-        send(client_socket, "ready", strlen("ready"), 0);
+        send(client_socket, "ready", strlen("ready"), 0); // Notify client to send file
+        printf("Server ready to receive file %s\n", filename);
         int bytes_read;
         while ((bytes_read = recv(client_socket, buffer, BUFFER_SIZE, 0)) > 0) {
+            //Check for termination signal
+            if (strncmp(buffer, "END_OF_FILE", 11) == 0) {
+                break;
+            }
             write(file, buffer, bytes_read);
         }
         close(file);
+        // Send final response to client after closing the file
         snprintf(buffer, BUFFER_SIZE, "File %s uploaded successfully\n", filename);
-        send(client_socket, buffer, strlen(buffer), 0);
-        return;
+        printf("Sending final response for file %s\n", filename);
+        send(client_socket, buffer, strlen(buffer), 0); // Send final response to client
     } else {
         snprintf(buffer, BUFFER_SIZE, "Unsupported file type: %s\n", filename);
         send(client_socket, buffer, strlen(buffer), 0);
-        return;
     }
-
-    send(client_socket, "ready", strlen("ready"), 0);
-    send_file_to_server(server_ip, server_port, filename, expanded_path);
 }
 
 
@@ -218,10 +242,10 @@ void send_file_to_server(const char *server_ip, int server_port, const char *fil
     adjusted_path[sizeof(adjusted_path) - 1] = '\0'; // Ensure null termination
     char *pos;
     if ((pos = strstr(adjusted_path, "/smain/")) != NULL) {
-        if (server_port == 8081) { // For PDF files
+        if (server_port == 8067) { // For PDF files
             strncpy(pos + 1, "spdf", 4); // Replace '/smain/' with '/spdf/'
             memmove(pos + 5, pos + 6, strlen(pos + 6) + 1); // Shift the rest of the string
-        } else if (server_port == 8082) { // For TXT files
+        } else if (server_port == 8068) { // For TXT files
             strncpy(pos + 1, "stext", 5); // Replace '/smain/' with '/stext/'
             memmove(pos + 6, pos + 6, strlen(pos + 6) + 1); // Shift the rest of the string
         }
@@ -244,4 +268,180 @@ void send_file_to_server(const char *server_ip, int server_port, const char *fil
 
     close(file);
     close(sock);
+}
+
+void send_rm_request_to_server(const char *server_ip, int server_port, const char *filename, int client_socket) {
+    int sock;
+    struct sockaddr_in server_addr;
+    char message[BUFFER_SIZE];
+    char adjusted_path[BUFFER_SIZE];
+
+    strncpy(adjusted_path, filename, sizeof(adjusted_path) - 1);
+    adjusted_path[sizeof(adjusted_path) - 1] = '\0'; // Ensure null termination
+    char *pos;
+
+    // Adjust the filename path to replace /smain/ with /stext/ or /spdf/
+    if ((pos = strstr(adjusted_path, "/smain/")) != NULL) {
+        if (server_port == 8067) { // For PDF files
+            strncpy(pos + 1, "spdf", 4); // Replace '/smain/' with '/spdf/'
+            memmove(pos + 5, pos + 6, strlen(pos + 6) + 1); // Shift the rest of the string
+        } else if (server_port == 8068) { // For TXT files
+            strncpy(pos + 1, "stext", 5); // Replace '/smain/' with '/stext/'
+            memmove(pos + 6, pos + 6, strlen(pos + 6) + 1); // Shift the rest of the string
+        }
+    }
+
+    snprintf(message, BUFFER_SIZE, "rmfile %s", adjusted_path);
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("Socket creation failed");
+        send(client_socket, "Error contacting server\n", 24, 0);
+        return;
+    }
+
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(server_port);
+    inet_pton(AF_INET, server_ip, &server_addr.sin_addr);
+
+    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Connection to server failed");
+        close(sock);
+        send(client_socket, "Error contacting server\n", 24, 0);
+        return;
+    }
+
+    send(sock, message, strlen(message), 0);
+
+    // Read server response and forward it to the client
+    int bytes_read;
+    while ((bytes_read = recv(sock, message, BUFFER_SIZE, 0)) > 0) {
+        send(client_socket, message, bytes_read, 0);
+    }
+
+    close(sock);
+}
+
+void handle_rmfile(int client_socket, char *filename) {
+    char buffer[BUFFER_SIZE];
+    char expanded_path[BUFFER_SIZE];
+    char server_message[BUFFER_SIZE];
+    char server_ip[BUFFER_SIZE];
+    int server_port;
+
+    expand_path(expanded_path, filename);
+
+    if (strstr(filename, ".pdf") != NULL) {
+        // Request Spdf server to delete the file
+        snprintf(server_message, BUFFER_SIZE, "rmfile %s", expanded_path);
+        strcpy(server_ip, "127.0.0.1");
+        server_port = 8067;
+    } else if (strstr(filename, ".txt") != NULL) {
+        // Request Stext server to delete the file
+        snprintf(server_message, BUFFER_SIZE, "rmfile %s", expanded_path);
+        strcpy(server_ip, "127.0.0.1");
+        server_port = 8068;
+    } else if (strstr(filename, ".c") != NULL) {
+        // Delete locally on Smain server
+        if (remove(expanded_path) == 0) {
+            snprintf(buffer, BUFFER_SIZE, "File %s deleted successfully\n", filename);
+        } else {
+            snprintf(buffer, BUFFER_SIZE, "Error deleting file %s\n", filename);
+        }
+        send(client_socket, buffer, strlen(buffer), 0);
+        return;
+    } else {
+        snprintf(buffer, BUFFER_SIZE, "Unsupported file type: %s\n", filename);
+        send(client_socket, buffer, strlen(buffer), 0);
+        return;
+    }
+
+    // Send request to the appropriate server
+    send_rm_request_to_server(server_ip, server_port, expanded_path, client_socket);
+}
+
+void create_tar(const char *directory, const char *tar_name) {
+    char cmd[BUFFER_SIZE];
+    snprintf(cmd, sizeof(cmd), "find %s -type f -name '*.c' | tar -cvf %s -T -", directory, tar_name);
+    system(cmd);
+}
+
+void send_file_to_client(int client_socket, const char *filename) {
+    int file;
+    char buffer[BUFFER_SIZE];
+    int bytes_read;
+
+    file = open(filename, O_RDONLY);
+    if (file < 0) {
+        perror("File open failed");
+        return;
+    }
+
+    while ((bytes_read = read(file, buffer, BUFFER_SIZE)) > 0) {
+        send(client_socket, buffer, bytes_read, 0);
+    }
+
+    close(file);
+    // Send termination signal to client
+    send(client_socket, "END_OF_FILE", strlen("END_OF_FILE"), 0);
+}
+
+void handle_dtar(int client_socket, const char *filetype) {
+    char tar_name[BUFFER_SIZE];
+
+    if (strcmp(filetype, ".c") == 0) {
+        create_tar("~/smain", "cfiles.tar");
+        strcpy(tar_name, "cfiles.tar");
+        send_file_to_client(client_socket, tar_name);
+    } else if (strcmp(filetype, ".pdf") == 0) {
+        send_tar_request_to_server(client_socket, "pdf.tar", "127.0.0.1", 8067);
+    } else if (strcmp(filetype, ".txt") == 0) {
+        send_tar_request_to_server(client_socket, "text.tar", "127.0.0.1", 8068);
+    } else {
+        send(client_socket, "Invalid file type\n", 18, 0);
+    }
+}
+
+void send_tar_request_to_server(int client_socket, const char *tar_name, const char *server_ip, int server_port) {
+    int sock;
+    struct sockaddr_in server_addr;
+    char buffer[BUFFER_SIZE];
+    int bytes_read;
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("Socket creation failed");
+        return;
+    }
+
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(server_port);
+    inet_pton(AF_INET, server_ip, &server_addr.sin_addr);
+
+    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Connection to server failed");
+        close(sock);
+        return;
+    }
+
+    snprintf(buffer, sizeof(buffer), "dtar %s", tar_name);
+    send(sock, buffer, strlen(buffer), 0);
+
+    // Receive the tar file from the server
+    FILE *file = fopen(tar_name, "wb");
+    if (file == NULL) {
+        perror("File open failed");
+        close(sock);
+        return;
+    }
+
+    while ((bytes_read = recv(sock, buffer, BUFFER_SIZE, 0)) > 0) {
+        fwrite(buffer, sizeof(char), bytes_read, file);
+    }
+
+    fclose(file);
+    close(sock);
+
+    // Send the tar file to the client
+    send_file_to_client(client_socket, tar_name);
 }

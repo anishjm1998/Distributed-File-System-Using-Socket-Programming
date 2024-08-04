@@ -9,12 +9,16 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
-#define PORT 8081
+#define PORT 8067
 #define BUFFER_SIZE 1024
 
 void handle_request(int client_socket);
 void create_dir(const char *path);
 void expand_path(char *expanded_path, const char *path);
+void handle_rmfile(int client_socket, char *filename);
+void handle_dtar(int client_socket);
+void send_file_to_smain(int client_socket, const char *filename);
+void create_tar(const char *directory, const char *tar_name);
 
 int main() {
     int server_socket, client_socket;
@@ -140,8 +144,65 @@ void handle_request(int client_socket) {
         close(file);
         snprintf(buffer, BUFFER_SIZE, "File %s stored successfully\n", filename);
         send(client_socket, buffer, strlen(buffer), 0);
+    } else if (strcmp(command, "dtar") == 0) {
+        handle_dtar(client_socket);
+    } else if (strcmp(command, "rmfile") == 0) {
+        handle_rmfile(client_socket, filename);
     } else {
         snprintf(buffer, BUFFER_SIZE, "Invalid command\n");
         send(client_socket, buffer, strlen(buffer), 0);
     }
+}
+
+void handle_rmfile(int client_socket, char *filename) {
+    char buffer[BUFFER_SIZE];
+    char expanded_path[BUFFER_SIZE];
+
+    expand_path(expanded_path, filename);
+
+    if (remove(expanded_path) == 0) {
+        snprintf(buffer, BUFFER_SIZE, "File %s deleted successfully\n", filename);
+    } else {
+        snprintf(buffer, BUFFER_SIZE, "Error deleting file %s\n", filename);
+    }
+    send(client_socket, buffer, strlen(buffer), 0);
+}
+
+void create_tar(const char *directory, const char *tar_name) {
+    char cmd[BUFFER_SIZE];
+    snprintf(cmd, sizeof(cmd), "find %s -type f -name '*.pdf' | tar -cvf %s -T -", directory, tar_name);
+    system(cmd);
+}
+
+void handle_dtar(int client_socket) {
+    printf("Handling DTAR command\n"); // Log when handling DTAR command
+
+    const char* directory = "~/spdf";
+    const char* tar_name = "pdf.tar";
+
+    printf("Creating tar file: %s\n", tar_name); // Log tar file creation
+    create_tar(directory, tar_name);
+
+    printf("Sending tar file to client: %s\n", tar_name); // Log tar file sending
+    send_file_to_smain(client_socket, tar_name);
+}
+
+void send_file_to_smain(int client_socket, const char *filename) {
+    int file;
+    char buffer[BUFFER_SIZE];
+    int bytes_read;
+
+    file = open(filename, O_RDONLY);
+    if (file < 0) {
+        perror("File open failed");
+        return;
+    }
+
+    while ((bytes_read = read(file, buffer, BUFFER_SIZE)) > 0) {
+        send(client_socket, buffer, bytes_read, 0);
+    }
+
+    close(file);
+    // Send termination signal to client
+    send(client_socket, "END_OF_FILE", strlen("END_OF_FILE"), 0);
 }
