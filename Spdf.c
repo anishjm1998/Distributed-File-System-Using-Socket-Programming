@@ -9,7 +9,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
-#define PORT 8067
+#define PORT 8555
 #define BUFFER_SIZE 1024
 
 void handle_request(int client_socket);
@@ -17,8 +17,9 @@ void create_dir(const char *path);
 void expand_path(char *expanded_path, const char *path);
 void handle_rmfile(int client_socket, char *filename);
 void handle_dtar(int client_socket);
-void send_file_to_smain(int client_socket, const char *filename);
-void create_tar(const char *directory, const char *tar_name);
+void collect_filenames(const char *directory, const char *filetype, char *output);
+void send_tar_content(int client_socket, const char *directory, const char *file_pattern);
+char* convert_path(const char *original_path);
 
 int main() {
     int server_socket, client_socket;
@@ -60,7 +61,7 @@ int main() {
         }
 
         printf("Connection accepted from %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-
+        
         child_pid = fork();
         if (child_pid == 0) {
             close(server_socket);
@@ -142,12 +143,44 @@ void handle_request(int client_socket) {
         }
 
         close(file);
-        snprintf(buffer, BUFFER_SIZE, "File %s stored successfully\n", filename);
+        snprintf(buffer, BUFFER_SIZE, "File %s uploaded successfully!\n", filename);
         send(client_socket, buffer, strlen(buffer), 0);
     } else if (strcmp(command, "dtar") == 0) {
         handle_dtar(client_socket);
     } else if (strcmp(command, "rmfile") == 0) {
         handle_rmfile(client_socket, filename);
+    } else if (strcmp(command, "display") == 0) {
+        char output[BUFFER_SIZE * 10] = ""; // Adjust size as needed
+
+        collect_filenames(filename, ".pdf", output); // Use the mapped path
+
+        // Print the collected files for debugging
+        printf("Collected files in Spdf:\n%s\n", output);
+
+        // Send the collected files to the client
+        send(client_socket, output, strlen(output), 0);
+        
+        // Close the client socket to indicate end of transmission
+        close(client_socket);
+    } else if (strcmp(command, "dfile") == 0) {
+        // Open the requested file based on the modified path
+        expand_path(expanded_path, filename);
+        file = open(expanded_path, O_RDONLY);
+        if (file < 0) {
+            // Send an error message to the client
+            snprintf(buffer, BUFFER_SIZE, "Error: File / Directory does not exist! Please check the file path provided!\n");
+            send(client_socket, buffer, strlen(buffer), 0);
+            close(client_socket);
+            return;
+        }
+
+        // Read the file content and send it back to the client
+        while ((bytes_read = read(file, buffer, BUFFER_SIZE)) > 0) {
+            send(client_socket, buffer, bytes_read, 0);
+        }
+
+        close(file);
+        send(client_socket, "END_OF_FILE", strlen("END_OF_FILE"), 0);
     } else {
         snprintf(buffer, BUFFER_SIZE, "Invalid command\n");
         send(client_socket, buffer, strlen(buffer), 0);
@@ -157,52 +190,118 @@ void handle_request(int client_socket) {
 void handle_rmfile(int client_socket, char *filename) {
     char buffer[BUFFER_SIZE];
     char expanded_path[BUFFER_SIZE];
+    char * newFilename[BUFFER_SIZE];
 
     expand_path(expanded_path, filename);
 
     if (remove(expanded_path) == 0) {
-        snprintf(buffer, BUFFER_SIZE, "File %s deleted successfully\n", filename);
+        snprintf(buffer, BUFFER_SIZE, "File deleted successfully!\n");
     } else {
-        snprintf(buffer, BUFFER_SIZE, "Error deleting file %s\n", filename);
+        snprintf(buffer, BUFFER_SIZE, "Wrong file/directory entered! Please check: %s\n", convert_path(filename));
     }
     send(client_socket, buffer, strlen(buffer), 0);
 }
 
-void create_tar(const char *directory, const char *tar_name) {
-    char cmd[BUFFER_SIZE];
-    snprintf(cmd, sizeof(cmd), "find %s -type f -name '*.pdf' | tar -cvf %s -T -", directory, tar_name);
-    system(cmd);
+char* convert_path(const char *original_path) {
+    // Allocate memory for the converted path
+    char *converted_path = (char *)malloc(strlen(original_path) + 1);
+    if (converted_path == NULL) {
+        perror("Failed to allocate memory");
+        return NULL;
+    }
+
+    // Copy the original path to the converted path
+    strcpy(converted_path, original_path);
+    char *pos;
+    // Replace /spdf/ with /smain/
+    pos = strstr(converted_path, "/spdf/");
+    if (pos != NULL) {
+        // Create a new temporary buffer to hold the modified string
+        char temp_buffer[BUFFER_SIZE];
+        snprintf(temp_buffer, sizeof(temp_buffer), "/smain/%s", pos + 6);
+        strcpy(pos, temp_buffer);
+    }
+
+    return converted_path;
 }
+
 
 void handle_dtar(int client_socket) {
-    printf("Handling DTAR command\n"); // Log when handling DTAR command
+    const char* directory = "~/spdf";  
+    const char* file_pattern = "*.pdf"; 
 
-    const char* directory = "~/spdf";
-    const char* tar_name = "pdf.tar";
-
-    printf("Creating tar file: %s\n", tar_name); // Log tar file creation
-    create_tar(directory, tar_name);
-
-    printf("Sending tar file to client: %s\n", tar_name); // Log tar file sending
-    send_file_to_smain(client_socket, tar_name);
+    send_tar_content(client_socket, directory, file_pattern);
 }
 
-void send_file_to_smain(int client_socket, const char *filename) {
-    int file;
+void send_tar_content(int client_socket, const char *directory, const char *file_pattern) {
+    char cmd[BUFFER_SIZE];
+    FILE *fp;
     char buffer[BUFFER_SIZE];
     int bytes_read;
 
-    file = open(filename, O_RDONLY);
-    if (file < 0) {
-        perror("File open failed");
+    // Expand the directory path if it contains '~'
+    char full_directory[BUFFER_SIZE];
+    if (directory[0] == '~') {
+        const char *home_dir = getenv("HOME");
+        snprintf(full_directory, sizeof(full_directory), "%s%s", home_dir, directory + 1);
+    } else {
+        strncpy(full_directory, directory, BUFFER_SIZE);
+    }
+
+    // First, check if there are any matching files
+    snprintf(cmd, sizeof(cmd), "find %s -type f -name '%s' -print -quit", full_directory, file_pattern);
+    fp = popen(cmd, "r");
+    if (fp == NULL) {
+        perror("Failed to run find command");
+        send(client_socket, "Error checking files\n", 21, 0);
         return;
     }
 
-    while ((bytes_read = read(file, buffer, BUFFER_SIZE)) > 0) {
+    // If no files found, inform the client and return
+    if (fgets(buffer, sizeof(buffer), fp) == NULL) {
+        send(client_socket, "No matching files found\n", 24, 0);
+        pclose(fp);
+        return;
+    }
+    pclose(fp);
+
+    // Proceed with tar creation using the simplified find and tar command
+    snprintf(cmd, sizeof(cmd), "cd %s && find . -type f -name '%s' | tar -cvf - -T -", full_directory, file_pattern);
+    fp = popen(cmd, "r");
+    if (fp == NULL) {
+        perror("Failed to run tar command");
+        send(client_socket, "Error creating tar\n", 19, 0);
+        return;
+    }
+
+    // Server-side: Send a small signal before the actual data
+    send(client_socket, "START_OF_FILE", strlen("START_OF_FILE"), 0);
+
+    // Stream the tar content to the client
+    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, fp)) > 0) {
         send(client_socket, buffer, bytes_read, 0);
     }
 
-    close(file);
-    // Send termination signal to client
+    pclose(fp);
     send(client_socket, "END_OF_FILE", strlen("END_OF_FILE"), 0);
+}
+
+
+void collect_filenames(const char *directory, const char *filetype, char *output) {
+    char cmd[BUFFER_SIZE];
+    FILE *fp;
+
+    // Adjust the find command to output full paths instead of basenames
+    snprintf(cmd, sizeof(cmd), "find %s -type f -name '*%s'", directory, filetype);
+    fp = popen(cmd, "r");
+    if (fp == NULL) {
+        perror("Failed to run command");
+        return;
+    }
+
+    while (fgets(cmd, sizeof(cmd), fp) != NULL) {
+        strcat(output, cmd);
+    }
+
+    pclose(fp);
 }
